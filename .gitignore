@@ -1,6 +1,11 @@
 # Binaries
 cli-proxy-api
+CLIProxyAPI-linux-amd64
 *.exe
+
+# Runtime logs
+cli-proxy-api.log
+cli-proxy-watchdog.log
 
 # Configuration
 config.yaml
