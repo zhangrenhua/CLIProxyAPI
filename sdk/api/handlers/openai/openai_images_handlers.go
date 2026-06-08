@@ -456,13 +456,32 @@ func multipartFileToDataURL(fileHeader *multipart.FileHeader) (string, error) {
 		return "", fmt.Errorf("read upload file failed: %w", err)
 	}
 
-	mediaType := strings.TrimSpace(fileHeader.Header.Get("Content-Type"))
-	if mediaType == "" {
-		mediaType = http.DetectContentType(data)
-	}
+	mediaType := resolveUploadedImageMediaType(fileHeader.Header.Get("Content-Type"), data)
 
 	b64 := base64.StdEncoding.EncodeToString(data)
 	return "data:" + mediaType + ";base64," + b64, nil
+}
+
+// resolveUploadedImageMediaType returns an image/* MIME type for an uploaded image.
+// Upstreams reject non-image data URLs (for example a declared
+// "application/octet-stream"), so when the multipart Content-Type is missing or not
+// an image type, the bytes are sniffed and finally defaulted to image/png.
+func resolveUploadedImageMediaType(declared string, data []byte) string {
+	mediaType := strings.TrimSpace(declared)
+	if i := strings.IndexByte(mediaType, ';'); i >= 0 {
+		mediaType = strings.TrimSpace(mediaType[:i])
+	}
+	if strings.HasPrefix(strings.ToLower(mediaType), "image/") {
+		return mediaType
+	}
+	sniffed := http.DetectContentType(data)
+	if i := strings.IndexByte(sniffed, ';'); i >= 0 {
+		sniffed = strings.TrimSpace(sniffed[:i])
+	}
+	if strings.HasPrefix(strings.ToLower(sniffed), "image/") {
+		return sniffed
+	}
+	return "image/png"
 }
 
 func buildOpenAICompatImagesJSONRequest(rawJSON []byte, imageModel string, stream bool) []byte {

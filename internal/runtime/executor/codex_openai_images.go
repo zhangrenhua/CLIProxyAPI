@@ -571,11 +571,31 @@ func codexMultipartFileToDataURL(fileHeader *multipart.FileHeader) (string, erro
 	if errRead != nil {
 		return "", fmt.Errorf("read upload file failed: %w", errRead)
 	}
-	mediaType := strings.TrimSpace(fileHeader.Header.Get("Content-Type"))
-	if mediaType == "" {
-		mediaType = http.DetectContentType(data)
-	}
+	mediaType := codexResolveUploadedImageMediaType(fileHeader.Header.Get("Content-Type"), data)
 	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
+// codexResolveUploadedImageMediaType returns an image/* MIME type for an uploaded
+// image. The Codex /responses upstream rejects non-image data URLs (for example a
+// declared "application/octet-stream"), so when the multipart Content-Type is
+// missing or not an image type, the bytes are sniffed and finally defaulted to
+// image/png.
+func codexResolveUploadedImageMediaType(declared string, data []byte) string {
+	mediaType := strings.TrimSpace(declared)
+	if i := strings.IndexByte(mediaType, ';'); i >= 0 {
+		mediaType = strings.TrimSpace(mediaType[:i])
+	}
+	if strings.HasPrefix(strings.ToLower(mediaType), "image/") {
+		return mediaType
+	}
+	sniffed := http.DetectContentType(data)
+	if i := strings.IndexByte(sniffed, ';'); i >= 0 {
+		sniffed = strings.TrimSpace(sniffed[:i])
+	}
+	if strings.HasPrefix(strings.ToLower(sniffed), "image/") {
+		return sniffed
+	}
+	return "image/png"
 }
 
 func codexExtractImagesFromResponsesCompleted(payload []byte) (results []codexImageCallResult, createdAt int64, usageRaw []byte, firstMeta codexImageCallResult, err error) {
