@@ -256,6 +256,34 @@ func TestNormalizeCodexResponsesLeavesValidToolChoiceUnchanged(t *testing.T) {
 	}
 }
 
+func TestNormalizeCodexResponsesStripsUnsupportedParams(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_tokens":100,"messages":[{"role":"user","content":"x"}],"frequency_penalty":0.5,"presence_penalty":0.1,"logit_bias":{"a":1},"logprobs":true,"top_logprobs":3,"n":2,"stop":["x"],"seed":7}`)
+
+	out := normalizeCodexResponsesRequest(context.Background(), "test", body)
+
+	for _, key := range []string{"max_tokens", "messages", "frequency_penalty", "presence_penalty", "logit_bias", "logprobs", "top_logprobs", "n", "stop", "seed"} {
+		if gjson.GetBytes(out, key).Exists() {
+			t.Fatalf("expected %q stripped, still present: %s", key, out)
+		}
+	}
+	// Supported fields must survive.
+	if gjson.GetBytes(out, "model").String() != "gpt-5.5" {
+		t.Fatalf("model should be preserved")
+	}
+	if gjson.GetBytes(out, "input.0.content.0.text").String() != "hi" {
+		t.Fatalf("input should be preserved")
+	}
+}
+
+func TestNormalizeCodexResponsesKeepsSupportedTokenField(t *testing.T) {
+	// Only the unsupported names are stripped; supported fields are untouched.
+	body := []byte(`{"model":"gpt-5.5","reasoning":{"effort":"medium"},"store":false}`)
+	out := normalizeCodexResponsesRequest(context.Background(), "test", body)
+	if string(out) != string(body) {
+		t.Fatalf("expected request with only supported fields unchanged.\nwant: %s\ngot:  %s", body, out)
+	}
+}
+
 func TestNormalizeCodexResponsesIgnoresNonArrayInput(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.5","input":"hello"}`)
 	out := normalizeCodexResponsesRequest(context.Background(), "test", body)

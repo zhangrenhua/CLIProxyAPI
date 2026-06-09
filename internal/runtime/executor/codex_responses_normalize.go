@@ -36,11 +36,52 @@ import (
 //  5. Chat Completions style forced tool_choice ({"type":"function",
 //     "function":{"name":...}}) is flattened to the Responses shape
 //     ({"type":"function","name":...}).
+//  6. Chat Completions only parameters the Codex /responses upstream rejects with
+//     "Unsupported parameter: <name>" (e.g. max_tokens, messages) are stripped.
 func normalizeCodexResponsesRequest(ctx context.Context, provider string, body []byte) []byte {
 	body = normalizeCodexResponsesInputItems(ctx, provider, body)
 	body = normalizeCodexResponsesToolDefinitions(ctx, provider, body)
 	body = normalizeCodexResponsesToolChoice(ctx, provider, body)
+	body = stripCodexResponsesUnsupportedParams(ctx, provider, body)
 	return body
+}
+
+// codexResponsesUnsupportedParams lists Chat Completions parameters that the Codex
+// /responses upstream rejects with "Unsupported parameter: <name>". They either
+// have no Responses equivalent or use a different field, so they are stripped
+// before forwarding. A well-formed Responses request never carries these, so
+// stripping them cannot break a request that was already valid.
+var codexResponsesUnsupportedParams = []string{
+	"max_tokens",
+	"messages",
+	"frequency_penalty",
+	"presence_penalty",
+	"logit_bias",
+	"logprobs",
+	"top_logprobs",
+	"n",
+	"stop",
+	"seed",
+}
+
+// stripCodexResponsesUnsupportedParams removes top-level parameters the Codex
+// /responses upstream does not accept. It is idempotent: absent keys are skipped.
+func stripCodexResponsesUnsupportedParams(ctx context.Context, provider string, body []byte) []byte {
+	provider = codexNormalizeProviderLabel(provider)
+	updated := body
+	for _, key := range codexResponsesUnsupportedParams {
+		if !gjson.GetBytes(updated, key).Exists() {
+			continue
+		}
+		next, err := sjson.DeleteBytes(updated, key)
+		if err != nil {
+			helps.LogWithRequestID(ctx).Debugf("%s: failed to strip unsupported parameter %q: %v", provider, key, err)
+			continue
+		}
+		updated = next
+		helps.LogWithRequestID(ctx).Debugf("%s: stripped unsupported Responses parameter %q", provider, key)
+	}
+	return updated
 }
 
 // normalizeCodexResponsesToolChoice flattens a Chat Completions style forced
