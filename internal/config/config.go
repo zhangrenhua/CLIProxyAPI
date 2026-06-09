@@ -262,6 +262,10 @@ type CodexHeaderDefaults struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	// ContextOverflowRetry, when true, makes the Codex executor automatically
+	// shrink/trim an oversized Responses request and retry after the upstream
+	// rejects it with context_too_large. Lossy (drops/truncates input); default off.
+	ContextOverflowRetry bool `yaml:"context-overflow-retry" json:"context-overflow-retry"`
 }
 
 // TLSConfig holds HTTPS server settings.

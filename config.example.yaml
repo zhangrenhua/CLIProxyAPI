@@ -154,6 +154,11 @@ codex:
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
+  # When true, if the Codex /responses upstream rejects a request with
+  # context_too_large, automatically shrink/trim the request and retry.
+  # This is lossy: it truncates oversized content, drops the oldest history,
+  # and shortens tool descriptions (tools are never removed). Default: false.
+  context-overflow-retry: false
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
