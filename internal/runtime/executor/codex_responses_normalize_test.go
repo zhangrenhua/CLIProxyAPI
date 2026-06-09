@@ -224,6 +224,38 @@ func TestNormalizeCodexResponsesKeepsMatchingNonEmptyOutput(t *testing.T) {
 	}
 }
 
+func TestNormalizeCodexResponsesFlattensChatStyleToolChoice(t *testing.T) {
+	body := []byte(`{"tool_choice":{"type":"function","function":{"name":"get_weather"}}}`)
+
+	out := normalizeCodexResponsesRequest(context.Background(), "test", body)
+
+	tc := gjson.GetBytes(out, "tool_choice")
+	if got := tc.Get("name").String(); got != "get_weather" {
+		t.Fatalf("expected flattened tool_choice.name get_weather, got %q", got)
+	}
+	if tc.Get("function").Exists() {
+		t.Fatalf("nested tool_choice.function should be removed: %s", tc.Raw)
+	}
+	if got := tc.Get("type").String(); got != "function" {
+		t.Fatalf("expected type function preserved, got %q", got)
+	}
+}
+
+func TestNormalizeCodexResponsesLeavesValidToolChoiceUnchanged(t *testing.T) {
+	cases := []string{
+		`{"tool_choice":"auto"}`,
+		`{"tool_choice":"required"}`,
+		`{"tool_choice":{"type":"function","name":"get_weather"}}`,
+		`{"tool_choice":{"type":"web_search"}}`,
+	}
+	for _, body := range cases {
+		out := normalizeCodexResponsesRequest(context.Background(), "test", []byte(body))
+		if string(out) != body {
+			t.Fatalf("expected tool_choice unchanged.\nwant: %s\ngot:  %s", body, out)
+		}
+	}
+}
+
 func TestNormalizeCodexResponsesIgnoresNonArrayInput(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.5","input":"hello"}`)
 	out := normalizeCodexResponsesRequest(context.Background(), "test", body)

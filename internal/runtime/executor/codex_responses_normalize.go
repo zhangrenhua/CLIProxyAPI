@@ -33,10 +33,50 @@ import (
 //  4. Chat Completions style function tool definitions ({"type":"function",
 //     "function":{...}}) are flattened to the Responses shape ({"type":"function",
 //     "name":..., "parameters":...}).
+//  5. Chat Completions style forced tool_choice ({"type":"function",
+//     "function":{"name":...}}) is flattened to the Responses shape
+//     ({"type":"function","name":...}).
 func normalizeCodexResponsesRequest(ctx context.Context, provider string, body []byte) []byte {
 	body = normalizeCodexResponsesInputItems(ctx, provider, body)
 	body = normalizeCodexResponsesToolDefinitions(ctx, provider, body)
+	body = normalizeCodexResponsesToolChoice(ctx, provider, body)
 	return body
+}
+
+// normalizeCodexResponsesToolChoice flattens a Chat Completions style forced
+// function tool_choice into the shape the Responses API expects. Chat puts the
+// name under "function" ({"type":"function","function":{"name":...}}); Responses
+// requires it at the top level ({"type":"function","name":...}) and otherwise
+// rejects with "Missing required parameter: 'tool_choice.name'". It only fires
+// when the choice nests a function name and lacks a top-level name, so string
+// choices ("auto"/"none"/"required"), built-in choices ({"type":"web_search"}),
+// and already-compliant function choices are left untouched.
+func normalizeCodexResponsesToolChoice(ctx context.Context, provider string, body []byte) []byte {
+	tc := gjson.GetBytes(body, "tool_choice")
+	if !tc.IsObject() {
+		return body
+	}
+	if strings.TrimSpace(tc.Get("type").String()) != "function" {
+		return body
+	}
+	if strings.TrimSpace(tc.Get("name").String()) != "" {
+		return body // already Responses-style
+	}
+	fn := tc.Get("function")
+	if !fn.IsObject() {
+		return body
+	}
+	name := strings.TrimSpace(fn.Get("name").String())
+	if name == "" {
+		return body // no name to flatten
+	}
+
+	provider = codexNormalizeProviderLabel(provider)
+	updated := body
+	updated, _ = sjson.SetBytes(updated, "tool_choice.name", name)
+	updated, _ = sjson.DeleteBytes(updated, "tool_choice.function")
+	helps.LogWithRequestID(ctx).Debugf("%s: flattened chat-style tool_choice function name", provider)
+	return updated
 }
 
 // normalizeCodexResponsesInputItems fixes role "tool" message items, chat-style
