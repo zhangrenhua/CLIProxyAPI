@@ -121,7 +121,9 @@ func normalizeCodexResponsesToolChoice(ctx context.Context, provider string, bod
 }
 
 // normalizeCodexResponsesInputItems fixes role "tool" message items, chat-style
-// content parts, and empty/orphan call_id values in the Responses "input" array.
+// content parts, empty/orphan call_id values, and function_call items missing a
+// name (recovered from a nested "function" object, or dropped with their paired
+// output) in the Responses "input" array.
 func normalizeCodexResponsesInputItems(ctx context.Context, provider string, body []byte) []byte {
 	input := gjson.GetBytes(body, "input")
 	if !input.Exists() || !input.IsArray() {
@@ -144,7 +146,8 @@ func normalizeCodexResponsesInputItems(ctx context.Context, provider string, bod
 
 	// Pass 2: rewrite items.
 	rebuilt := make([][]byte, 0, len(items))
-	pendingCallIDs := make([]string, 0, 4) // function_call ids awaiting their output, FIFO
+	pendingCallIDs := make([]string, 0, 4)         // function_call ids awaiting their output, FIFO
+	droppedCallIDs := make(map[string]struct{}, 2) // function_call ids removed (e.g. missing name)
 	syntheticSeq := 0
 	changed := false
 
@@ -179,6 +182,31 @@ func normalizeCodexResponsesInputItems(ctx context.Context, provider string, bod
 		switch itemType {
 		case "function_call":
 			callID := strings.TrimSpace(gjson.GetBytes(raw, "call_id").String())
+			// Responses requires a top-level "name". Recover it from a chat-style
+			// nested "function" object when missing; carry arguments along too.
+			if strings.TrimSpace(gjson.GetBytes(raw, "name").String()) == "" {
+				if fn := gjson.GetBytes(raw, "function"); fn.IsObject() {
+					if fnName := strings.TrimSpace(fn.Get("name").String()); fnName != "" {
+						raw, _ = sjson.SetBytes(raw, "name", fnName)
+						if args := fn.Get("arguments"); args.Exists() && !gjson.GetBytes(raw, "arguments").Exists() {
+							raw, _ = sjson.SetBytes(raw, "arguments", args.String())
+						}
+						raw, _ = sjson.DeleteBytes(raw, "function")
+						changed = true
+						helps.LogWithRequestID(ctx).Debugf("%s: flattened chat-style function_call name at input[%d]", provider, index)
+					}
+				}
+			}
+			// A function_call with no name is invalid; drop it (its paired output is
+			// dropped below) since it cannot be repaired.
+			if strings.TrimSpace(gjson.GetBytes(raw, "name").String()) == "" {
+				if callID != "" {
+					droppedCallIDs[callID] = struct{}{}
+				}
+				changed = true
+				helps.LogWithRequestID(ctx).Debugf("%s: dropped function_call without a name at input[%d]", provider, index)
+				continue
+			}
 			if callID == "" {
 				syntheticSeq++
 				callID = fmt.Sprintf("call_normalized_%d", syntheticSeq)
@@ -202,6 +230,12 @@ func normalizeCodexResponsesInputItems(ctx context.Context, provider string, bod
 				changed = true
 				helps.LogWithRequestID(ctx).Debugf("%s: paired function_call_output at input[%d] with call_id %q", provider, index, callID)
 			default:
+				if _, dropped := droppedCallIDs[callID]; dropped {
+					// Its function_call was removed (e.g. missing name); drop the output too.
+					changed = true
+					helps.LogWithRequestID(ctx).Debugf("%s: dropped function_call_output at input[%d] (its function_call %q was removed)", provider, index, callID)
+					continue
+				}
 				if _, ok := validCallIDs[callID]; !ok {
 					// Non-empty call_id that matches no function_call in the input.
 					changed = true

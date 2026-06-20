@@ -8,6 +8,52 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestNormalizeCodexResponsesFlattensFunctionCallName(t *testing.T) {
+	// function_call with a nested chat-style function{name,arguments} but no
+	// top-level name -> name/arguments flattened, function removed.
+	body := []byte(`{"input":[{"type":"function_call","call_id":"c1","function":{"name":"get_weather","arguments":"{\"q\":1}"}},{"type":"function_call_output","call_id":"c1","output":"ok"}]}`)
+
+	out := normalizeCodexResponsesRequest(context.Background(), "test", body)
+
+	fc := gjson.GetBytes(out, "input.0")
+	if got := fc.Get("name").String(); got != "get_weather" {
+		t.Fatalf("expected flattened name get_weather, got %q", got)
+	}
+	if got := fc.Get("arguments").String(); got != `{"q":1}` {
+		t.Fatalf("expected flattened arguments, got %q", got)
+	}
+	if fc.Get("function").Exists() {
+		t.Fatalf("nested function should be removed: %s", fc.Raw)
+	}
+	// Its output is kept (call still valid after flatten).
+	if n := len(gjson.GetBytes(out, "input").Array()); n != 2 {
+		t.Fatalf("expected both items kept, got %d", n)
+	}
+}
+
+func TestNormalizeCodexResponsesDropsNamelessFunctionCallAndOutput(t *testing.T) {
+	// function_call with no recoverable name -> dropped together with its output.
+	body := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"type":"function_call","call_id":"c1","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"ok"}]}`)
+
+	out := normalizeCodexResponsesRequest(context.Background(), "test", body)
+
+	items := gjson.GetBytes(out, "input").Array()
+	if len(items) != 1 {
+		t.Fatalf("expected nameless function_call and its output dropped (len 1), got %d: %s", len(items), gjson.GetBytes(out, "input").Raw)
+	}
+	if got := items[0].Get("role").String(); got != "user" {
+		t.Fatalf("expected the user message to survive, got role %q", got)
+	}
+}
+
+func TestNormalizeCodexResponsesKeepsNamedFunctionCall(t *testing.T) {
+	body := []byte(`{"input":[{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"ok"}]}`)
+	out := normalizeCodexResponsesRequest(context.Background(), "test", body)
+	if string(out) != string(body) {
+		t.Fatalf("expected a valid named function_call to be unchanged.\nwant: %s\ngot:  %s", body, out)
+	}
+}
+
 func TestNormalizeCodexResponsesRewritesToolRole(t *testing.T) {
 	body := []byte(`{"input":[
 		{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
