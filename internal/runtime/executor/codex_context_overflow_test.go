@@ -131,6 +131,25 @@ func TestReduceCombinedTrimsHistory(t *testing.T) {
 	}
 }
 
+func TestReduceLeavesNonResponsesPayloadUntouched(t *testing.T) {
+	// Claude-style payload (uses "messages", and "tools" with a long "description").
+	// The reduce must NOT touch it: no "input" array -> return (payload, false) and
+	// must never strip "messages" or shorten the Claude tool description.
+	longDesc := strings.Repeat("d", codexToolDescCharCap+200)
+	body := []byte(fmt.Sprintf(`{"model":"x","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"f","description":%q}]}`, longDesc))
+
+	out, ok := reduceCodexResponsesBodyForOverflow(context.Background(), "test", body)
+	if ok {
+		t.Fatalf("non-Responses payload must not be reduced")
+	}
+	if string(out) != string(body) {
+		t.Fatalf("non-Responses payload must be returned unchanged")
+	}
+	if !gjson.GetBytes(out, "messages").Exists() {
+		t.Fatalf("messages must be preserved for a Claude-style payload")
+	}
+}
+
 func TestReduceReturnsFalseWhenNothingToReduce(t *testing.T) {
 	body := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
 	if _, ok := reduceCodexResponsesBodyForOverflow(context.Background(), "test", body); ok {

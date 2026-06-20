@@ -99,6 +99,13 @@ func reduceCodexResponsesBodyForOverflow(ctx context.Context, provider string, p
 	if !gjson.ValidBytes(payload) {
 		return payload, false
 	}
+	// Only operate on Responses-format payloads (identified by an "input" array).
+	// Other source formats (e.g. Claude/Chat use "messages") must not be touched:
+	// they share field names like "tools"/"description" and stripping would corrupt
+	// them (e.g. removing the Claude "messages" conversation).
+	if !gjson.GetBytes(payload, "input").IsArray() {
+		return payload, false
+	}
 	out := payload
 	changed := false
 	if r, ok := shrinkCodexLargeContent(ctx, provider, out, codexContentCharCap); ok {
