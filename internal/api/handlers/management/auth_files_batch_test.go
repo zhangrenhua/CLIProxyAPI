@@ -83,6 +83,91 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 	}
 }
 
+func TestUploadAuthFile_JSONArrayRawBody(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	arrayBody := `[
+		{"type":"codex","email":"one@example.com","account_id":"acc-1","access_token":"a","refresh_token":"r","expired":false},
+		{"type":"codex","email":"two@example.com","account_id":"acc-2","access_token":"a","refresh_token":"r","expired":false}
+	]`
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files?name=cpa-accounts.json", bytes.NewBufferString(arrayBody))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected upload status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	// Each element is written as its own "<type>-<email>.json" file.
+	for _, name := range []string{"codex-one@example.com.json", "codex-two@example.com.json"} {
+		if _, err := os.Stat(filepath.Join(authDir, name)); err != nil {
+			t.Fatalf("expected split auth file %s to exist: %v", name, err)
+		}
+	}
+
+	auths := manager.List()
+	if len(auths) != 2 {
+		t.Fatalf("expected 2 auth entries, got %d", len(auths))
+	}
+}
+
+func TestUploadAuthFile_JSONArrayMultipart(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	arrayBody := `[{"type":"codex","email":"a@example.com"},{"type":"codex","account_id":"acc-x"}]`
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "cpa-accounts.json")
+	if err != nil {
+		t.Fatalf("failed to create multipart file: %v", err)
+	}
+	if _, err = part.Write([]byte(arrayBody)); err != nil {
+		t.Fatalf("failed to write multipart content: %v", err)
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatalf("failed to close multipart writer: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected upload status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	// Email element -> codex-<email>.json; element without email falls back to account_id.
+	for _, name := range []string{"codex-a@example.com.json", "codex-acc-x.json"} {
+		if _, err := os.Stat(filepath.Join(authDir, name)); err != nil {
+			t.Fatalf("expected split auth file %s to exist: %v", name, err)
+		}
+	}
+
+	if auths := manager.List(); len(auths) != 2 {
+		t.Fatalf("expected 2 auth entries, got %d", len(auths))
+	}
+}
+
 func TestUploadAuthFile_BatchMultipart_InvalidJSONDoesNotOverwriteExistingFile(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 

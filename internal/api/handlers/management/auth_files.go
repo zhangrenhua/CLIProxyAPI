@@ -941,7 +941,41 @@ func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.Fil
 	return name, nil
 }
 
+// writeAuthFile persists an uploaded auth payload. When the payload is a
+// top-level JSON array of accounts, each element is written as its own auth file
+// so the rest of the system keeps its "one account per file" on-disk format.
 func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
+	elements, isArray := splitAuthFileArray(data)
+	if !isArray {
+		return h.writeSingleAuthFile(ctx, name, data)
+	}
+	if len(elements) == 0 {
+		return fmt.Errorf("auth file array is empty")
+	}
+	var firstErr error
+	written := 0
+	for i, element := range elements {
+		elementName := h.authFileNameForArrayElement(name, i, element)
+		if err := h.writeSingleAuthFile(ctx, elementName, element); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("entry %d: %w", i+1, err)
+			}
+			// Surface per-entry failures so a partially successful import is not silent.
+			log.Warnf("auth file array import: skipping entry %d: %v", i+1, err)
+			continue
+		}
+		written++
+	}
+	if written == 0 {
+		return firstErr
+	}
+	if firstErr != nil {
+		log.Warnf("auth file array import: wrote %d/%d entries", written, len(elements))
+	}
+	return nil
+}
+
+func (h *Handler) writeSingleAuthFile(ctx context.Context, name string, data []byte) error {
 	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
 	if !filepath.IsAbs(dst) {
 		if abs, errAbs := filepath.Abs(dst); errAbs == nil {
@@ -959,6 +993,63 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		return err
 	}
 	return nil
+}
+
+// splitAuthFileArray reports whether data is a top-level JSON array and, if so,
+// returns the raw JSON bytes of each element.
+func splitAuthFileArray(data []byte) ([][]byte, bool) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, false
+	}
+	var raw []json.RawMessage
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return nil, false
+	}
+	out := make([][]byte, 0, len(raw))
+	for _, item := range raw {
+		out = append(out, []byte(item))
+	}
+	return out, true
+}
+
+// authFileNameForArrayElement derives a per-account file name for one element of
+// an uploaded auth array, preferring "<type>-<email>.json" and falling back to
+// the uploaded file name with an index suffix.
+func (h *Handler) authFileNameForArrayElement(baseName string, index int, data []byte) string {
+	fallback := func() string {
+		base := filepath.Base(strings.TrimSpace(baseName))
+		base = strings.TrimSuffix(base, filepath.Ext(base))
+		if base == "" || base == "." || base == ".." {
+			base = "auth"
+		}
+		return fmt.Sprintf("%s-%d.json", base, index+1)
+	}
+	meta := make(map[string]any)
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return fallback()
+	}
+	provider, _ := meta["type"].(string)
+	provider = strings.TrimSpace(provider)
+	identifier, _ := meta["email"].(string)
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		if accountID, ok := meta["account_id"].(string); ok {
+			identifier = strings.TrimSpace(accountID)
+		}
+	}
+	if identifier == "" {
+		return fallback()
+	}
+	candidate := identifier + ".json"
+	if provider != "" {
+		candidate = fmt.Sprintf("%s-%s.json", provider, identifier)
+	}
+	candidate = filepath.Base(candidate)
+	if isUnsafeAuthFileName(candidate) {
+		return fallback()
+	}
+	return candidate
 }
 
 func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
