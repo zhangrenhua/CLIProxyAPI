@@ -44,17 +44,24 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
 	if client == nil {
 		return pluginapi.Plugin{}, fmt.Errorf("plugin client is nil")
 	}
-	resp, errCall := callPlugin[rpcRegistration](ctx, client, method, rpcLifecycleRequest{ConfigYAML: bytes.Clone(configYAML)})
+	resp, errCall := callPlugin[rpcRegistration](ctx, client, method, rpcLifecycleRequest{
+		ConfigYAML:    bytes.Clone(configYAML),
+		SchemaVersion: pluginabi.SchemaVersion,
+	})
 	if errCall != nil {
 		return pluginapi.Plugin{}, errCall
+	}
+	if resp.SchemaVersion > pluginabi.SchemaVersion {
+		return pluginapi.Plugin{}, fmt.Errorf("plugin schema version %d is not supported", resp.SchemaVersion)
 	}
 	adapter := &rpcPluginAdapter{id: id, host: host, client: client}
 	plugin := pluginapi.Plugin{
 		Metadata: resp.Metadata,
 		Capabilities: pluginapi.Capabilities{
-			ExecutorModelScope:    resp.Capabilities.ExecutorModelScope,
-			ExecutorInputFormats:  append([]string(nil), resp.Capabilities.ExecutorInputFormats...),
-			ExecutorOutputFormats: append([]string(nil), resp.Capabilities.ExecutorOutputFormats...),
+			FrontendAuthProviderExclusive: resp.Capabilities.FrontendAuthProvider && resp.Capabilities.FrontendAuthProviderExclusive,
+			ExecutorModelScope:            resp.Capabilities.ExecutorModelScope,
+			ExecutorInputFormats:          append([]string(nil), resp.Capabilities.ExecutorInputFormats...),
+			ExecutorOutputFormats:         append([]string(nil), resp.Capabilities.ExecutorOutputFormats...),
 		},
 	}
 	if resp.Capabilities.ModelRegistrar {
@@ -68,6 +75,12 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
 	}
 	if resp.Capabilities.FrontendAuthProvider {
 		plugin.Capabilities.FrontendAuthProvider = rpcFrontendAuthProvider{rpcPluginAdapter: adapter}
+	}
+	if resp.Capabilities.Scheduler {
+		plugin.Capabilities.Scheduler = adapter
+	}
+	if resp.Capabilities.ModelRouter {
+		plugin.Capabilities.ModelRouter = adapter
 	}
 	if resp.Capabilities.Executor {
 		plugin.Capabilities.Executor = rpcProviderExecutor{rpcPluginAdapter: adapter}
@@ -146,6 +159,15 @@ func sanitizePluginRequest(request any) any {
 	case pluginapi.AuthModelRequest:
 		req.HTTPClient = nil
 		return req
+	case pluginapi.SchedulerPickRequest:
+		req.Options.Metadata = sanitizePluginMetadata(req.Options.Metadata)
+		for index := range req.Candidates {
+			req.Candidates[index].Metadata = sanitizePluginMetadata(req.Candidates[index].Metadata)
+		}
+		return req
+	case pluginapi.ModelRouteRequest:
+		req.Metadata = sanitizePluginMetadata(req.Metadata)
+		return req
 	case pluginapi.ExecutorRequest:
 		req.HTTPClient = nil
 		req.Metadata = sanitizePluginMetadata(req.Metadata)
@@ -157,6 +179,18 @@ func sanitizePluginRequest(request any) any {
 		req.Metadata = sanitizePluginMetadata(req.Metadata)
 		return req
 	case pluginapi.StreamChunkInterceptRequest:
+		req.Metadata = sanitizePluginMetadata(req.Metadata)
+		return req
+	case rpcRequestInterceptRequest:
+		req.Metadata = sanitizePluginMetadata(req.Metadata)
+		return req
+	case rpcModelRouteRequest:
+		req.Metadata = sanitizePluginMetadata(req.Metadata)
+		return req
+	case rpcResponseInterceptRequest:
+		req.Metadata = sanitizePluginMetadata(req.Metadata)
+		return req
+	case rpcStreamChunkInterceptRequest:
 		req.Metadata = sanitizePluginMetadata(req.Metadata)
 		return req
 	case pluginapi.ExecutorHTTPRequest:
@@ -266,7 +300,7 @@ func (a *rpcPluginAdapter) openHostCallbackContext(ctx context.Context) (string,
 	if a == nil || a.host == nil {
 		return "", func() {}
 	}
-	return a.host.openCallbackContext(ctx)
+	return a.host.openCallbackContextForPlugin(ctx, a.id)
 }
 
 func (a *rpcPluginAdapter) RegisterModels(ctx context.Context, req pluginapi.ModelRegistrationRequest) (pluginapi.ModelRegistrationResponse, error) {
@@ -283,6 +317,19 @@ func (a *rpcPluginAdapter) ModelsForAuth(ctx context.Context, req pluginapi.Auth
 	return callPlugin[pluginapi.ModelResponse](ctx, a.client, pluginabi.MethodModelForAuth, rpcAuthModelRequest{
 		AuthModelRequest: req,
 		HostCallbackID:   callbackID,
+	})
+}
+
+func (a *rpcPluginAdapter) Pick(ctx context.Context, req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, error) {
+	return callPlugin[pluginapi.SchedulerPickResponse](ctx, a.client, pluginabi.MethodSchedulerPick, req)
+}
+
+func (a *rpcPluginAdapter) RouteModel(ctx context.Context, req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, error) {
+	callbackID, closeCallback := a.openHostCallbackContext(ctx)
+	defer closeCallback()
+	return callPlugin[pluginapi.ModelRouteResponse](ctx, a.client, pluginabi.MethodModelRoute, rpcModelRouteRequest{
+		ModelRouteRequest: req,
+		HostCallbackID:    callbackID,
 	})
 }
 
@@ -354,35 +401,6 @@ func (a *rpcPluginAdapter) Execute(ctx context.Context, req pluginapi.ExecutorRe
 	})
 }
 
-func (a *rpcPluginAdapter) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
-	if a == nil || a.host == nil || a.host.streams == nil {
-		return pluginapi.ExecutorStreamResponse{}, fmt.Errorf("plugin stream bridge is unavailable")
-	}
-	streamID, chunks, cleanup := a.host.streams.open(ctx)
-	callbackID, closeCallback := a.openHostCallbackContext(ctx)
-	defer closeCallback()
-	rpcReq := rpcExecutorRequest{
-		ExecutorRequest: req,
-		StreamID:        streamID,
-		HostCallbackID:  callbackID,
-	}
-	resp, errCall := callPlugin[rpcExecutorStreamResponse](ctx, a.client, pluginabi.MethodExecutorExecuteStream, rpcReq)
-	if errCall != nil {
-		cleanup()
-		return pluginapi.ExecutorStreamResponse{}, errCall
-	}
-	if len(resp.Chunks) > 0 {
-		cleanup()
-		out := make(chan pluginapi.ExecutorStreamChunk, len(resp.Chunks))
-		for _, chunk := range resp.Chunks {
-			out <- chunk
-		}
-		close(out)
-		return pluginapi.ExecutorStreamResponse{Headers: resp.Headers, Chunks: out}, nil
-	}
-	return pluginapi.ExecutorStreamResponse{Headers: resp.Headers, Chunks: chunks}, nil
-}
-
 func (a *rpcPluginAdapter) CountTokens(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
 	callbackID, closeCallback := a.openHostCallbackContext(ctx)
 	defer closeCallback()
@@ -409,8 +427,22 @@ func (a *rpcPluginAdapter) NormalizeRequest(ctx context.Context, req pluginapi.R
 	return callPlugin[pluginapi.PayloadResponse](ctx, a.client, pluginabi.MethodRequestNormalize, req)
 }
 
-func (a *rpcPluginAdapter) InterceptRequest(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
-	return callPlugin[pluginapi.RequestInterceptResponse](ctx, a.client, pluginabi.MethodRequestInterceptBefore, req)
+func (a *rpcPluginAdapter) InterceptRequestBeforeAuth(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+	callbackID, closeCallback := a.openHostCallbackContext(ctx)
+	defer closeCallback()
+	return callPlugin[pluginapi.RequestInterceptResponse](ctx, a.client, pluginabi.MethodRequestInterceptBefore, rpcRequestInterceptRequest{
+		RequestInterceptRequest: req,
+		HostCallbackID:          callbackID,
+	})
+}
+
+func (a *rpcPluginAdapter) InterceptRequestAfterAuth(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+	callbackID, closeCallback := a.openHostCallbackContext(ctx)
+	defer closeCallback()
+	return callPlugin[pluginapi.RequestInterceptResponse](ctx, a.client, pluginabi.MethodRequestInterceptAfter, rpcRequestInterceptRequest{
+		RequestInterceptRequest: req,
+		HostCallbackID:          callbackID,
+	})
 }
 
 func (a *rpcPluginAdapter) TranslateResponse(ctx context.Context, req pluginapi.ResponseTransformRequest) (pluginapi.PayloadResponse, error) {
@@ -422,11 +454,21 @@ func (a rpcResponseNormalizer) NormalizeResponse(ctx context.Context, req plugin
 }
 
 func (a *rpcPluginAdapter) InterceptResponse(ctx context.Context, req pluginapi.ResponseInterceptRequest) (pluginapi.ResponseInterceptResponse, error) {
-	return callPlugin[pluginapi.ResponseInterceptResponse](ctx, a.client, pluginabi.MethodResponseInterceptAfter, req)
+	callbackID, closeCallback := a.openHostCallbackContext(ctx)
+	defer closeCallback()
+	return callPlugin[pluginapi.ResponseInterceptResponse](ctx, a.client, pluginabi.MethodResponseInterceptAfter, rpcResponseInterceptRequest{
+		ResponseInterceptRequest: req,
+		HostCallbackID:           callbackID,
+	})
 }
 
 func (a *rpcPluginAdapter) InterceptStreamChunk(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) (pluginapi.StreamChunkInterceptResponse, error) {
-	return callPlugin[pluginapi.StreamChunkInterceptResponse](ctx, a.client, pluginabi.MethodResponseInterceptStreamChunk, req)
+	callbackID, closeCallback := a.openHostCallbackContext(ctx)
+	defer closeCallback()
+	return callPlugin[pluginapi.StreamChunkInterceptResponse](ctx, a.client, pluginabi.MethodResponseInterceptStreamChunk, rpcStreamChunkInterceptRequest{
+		StreamChunkInterceptRequest: req,
+		HostCallbackID:              callbackID,
+	})
 }
 
 func (a rpcThinkingApplier) ApplyThinking(ctx context.Context, req pluginapi.ThinkingApplyRequest) (pluginapi.PayloadResponse, error) {
@@ -460,11 +502,21 @@ func (a *rpcPluginAdapter) RegisterManagement(ctx context.Context, req pluginapi
 		route.Handler = a
 		routes = append(routes, route)
 	}
-	return pluginapi.ManagementRegistrationResponse{Routes: routes}, nil
+	resources := make([]pluginapi.ResourceRoute, 0, len(resp.Resources))
+	for _, route := range resp.Resources {
+		route.Handler = a
+		resources = append(resources, route)
+	}
+	return pluginapi.ManagementRegistrationResponse{Routes: routes, Resources: resources}, nil
 }
 
 func (a *rpcPluginAdapter) HandleManagement(ctx context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
-	return callPlugin[pluginapi.ManagementResponse](ctx, a.client, pluginabi.MethodManagementHandle, req)
+	callbackID, closeCallback := a.openHostCallbackContext(ctx)
+	defer closeCallback()
+	return callPlugin[pluginapi.ManagementResponse](ctx, a.client, pluginabi.MethodManagementHandle, rpcManagementRequest{
+		ManagementRequest: req,
+		HostCallbackID:    callbackID,
+	})
 }
 
 func httpResponseFromPlugin(resp pluginapi.ExecutorHTTPResponse, req *http.Request) *http.Response {

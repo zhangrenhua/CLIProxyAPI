@@ -3,7 +3,11 @@ package pluginabi
 import "encoding/json"
 
 const (
-	ABIVersion    uint32 = 1
+	// ABIVersion tracks the native C ABI shape (native plugin exports).
+	ABIVersion uint32 = 1
+	// SchemaVersion tracks the RPC JSON contract exchanged at plugin.register.
+	// Increment only for breaking RPC changes. New capabilities such as ModelRouter
+	// are gated by capability flags and method names while the version stays at 1.
 	SchemaVersion uint32 = 1
 )
 
@@ -25,6 +29,11 @@ const (
 	MethodFrontendAuthIdentifier   = "frontend_auth.identifier"
 	MethodFrontendAuthAuthenticate = "frontend_auth.authenticate"
 
+	// MethodSchedulerPick asks a scheduler plugin to select an auth candidate.
+	MethodSchedulerPick = "scheduler.pick"
+	// MethodModelRoute asks a router plugin to select a plugin executor for a matching request.
+	MethodModelRoute = "model.route"
+
 	MethodExecutorIdentifier    = "executor.identifier"
 	MethodExecutorExecute       = "executor.execute"
 	MethodExecutorExecuteStream = "executor.execute_stream"
@@ -34,6 +43,7 @@ const (
 	MethodRequestTranslate       = "request.translate"
 	MethodRequestNormalize       = "request.normalize"
 	MethodRequestInterceptBefore = "request.intercept_before"
+	MethodRequestInterceptAfter  = "request.intercept_after"
 
 	MethodResponseTranslate            = "response.translate"
 	MethodResponseNormalizeBefore      = "response.normalize_before"
@@ -52,13 +62,21 @@ const (
 	MethodManagementRegister = "management.register"
 	MethodManagementHandle   = "management.handle"
 
-	MethodHostHTTPDo          = "host.http.do"
-	MethodHostHTTPDoStream    = "host.http.do_stream"
-	MethodHostHTTPStreamRead  = "host.http.stream_read"
-	MethodHostHTTPStreamClose = "host.http.stream_close"
-	MethodHostStreamEmit      = "host.stream.emit"
-	MethodHostStreamClose     = "host.stream.close"
-	MethodHostLog             = "host.log"
+	MethodHostHTTPDo             = "host.http.do"
+	MethodHostHTTPDoStream       = "host.http.do_stream"
+	MethodHostHTTPStreamRead     = "host.http.stream_read"
+	MethodHostHTTPStreamClose    = "host.http.stream_close"
+	MethodHostModelExecute       = "host.model.execute"
+	MethodHostModelExecuteStream = "host.model.execute_stream"
+	MethodHostModelStreamRead    = "host.model.stream_read"
+	MethodHostModelStreamClose   = "host.model.stream_close"
+	MethodHostStreamEmit         = "host.stream.emit"
+	MethodHostStreamClose        = "host.stream.close"
+	MethodHostLog                = "host.log"
+	MethodHostAuthList           = "host.auth.list"
+	MethodHostAuthGet            = "host.auth.get"
+	MethodHostAuthGetRuntime     = "host.auth.get_runtime"
+	MethodHostAuthSave           = "host.auth.save"
 )
 
 type Envelope struct {

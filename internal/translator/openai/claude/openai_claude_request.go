@@ -103,25 +103,41 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	// Handle system message first
 	systemMsgJSON := []byte(`{"role":"system","content":[]}`)
 	hasSystemContent := false
-	if system := root.Get("system"); system.Exists() {
-		if system.Type == gjson.String {
-			if system.String() != "" && !util.IsClaudeCodeAttributionSystemText(system.String()) {
-				oldSystem := []byte(`{"type":"text","text":""}`)
-				oldSystem, _ = sjson.SetBytes(oldSystem, "text", system.String())
-				systemMsgJSON, _ = sjson.SetRawBytes(systemMsgJSON, "content.-1", oldSystem)
-				hasSystemContent = true
-			}
-		} else if system.Type == gjson.JSON {
-			if system.IsArray() {
-				systemResults := system.Array()
-				for i := 0; i < len(systemResults); i++ {
-					if contentItem, ok := convertClaudeContentPart(systemResults[i]); ok {
-						systemMsgJSON, _ = sjson.SetRawBytes(systemMsgJSON, "content.-1", []byte(contentItem))
-						hasSystemContent = true
-					}
-				}
-			}
+	appendSystemContent := func(content gjson.Result) {
+		if !content.Exists() {
+			return
 		}
+		if content.Type == gjson.String {
+			if content.String() == "" || util.IsClaudeCodeAttributionSystemText(content.String()) {
+				return
+			}
+			oldSystem := []byte(`{"type":"text","text":""}`)
+			oldSystem, _ = sjson.SetBytes(oldSystem, "text", content.String())
+			systemMsgJSON, _ = sjson.SetRawBytes(systemMsgJSON, "content.-1", oldSystem)
+			hasSystemContent = true
+			return
+		}
+		if content.IsArray() {
+			content.ForEach(func(_, item gjson.Result) bool {
+				if contentItem, ok := convertClaudeContentPart(item); ok {
+					systemMsgJSON, _ = sjson.SetRawBytes(systemMsgJSON, "content.-1", []byte(contentItem))
+					hasSystemContent = true
+				}
+				return true
+			})
+		}
+	}
+
+	if system := root.Get("system"); system.Exists() {
+		appendSystemContent(system)
+	}
+	if messages := root.Get("messages"); messages.Exists() && messages.IsArray() {
+		messages.ForEach(func(_, message gjson.Result) bool {
+			if message.Get("role").String() == "system" {
+				appendSystemContent(message.Get("content"))
+			}
+			return true
+		})
 	}
 	// Only add system message if it has content
 	if hasSystemContent {
@@ -132,6 +148,9 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	if messages := root.Get("messages"); messages.Exists() && messages.IsArray() {
 		messages.ForEach(func(_, message gjson.Result) bool {
 			role := message.Get("role").String()
+			if role == "system" {
+				return true
+			}
 			contentResult := message.Get("content")
 
 			// Handle content
@@ -294,7 +313,7 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 
 			// Convert Anthropic input_schema to OpenAI function parameters
 			if inputSchema := tool.Get("input_schema"); inputSchema.Exists() {
-				openAIToolJSON, _ = sjson.SetBytes(openAIToolJSON, "function.parameters", inputSchema.Value())
+				openAIToolJSON, _ = sjson.SetBytes(openAIToolJSON, "function.parameters", normalizeObjectSchemaProperties(inputSchema.Value()))
 			}
 
 			toolsJSON, _ = sjson.SetRawBytes(toolsJSON, "-1", openAIToolJSON)
@@ -331,6 +350,28 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	}
 
 	return out
+}
+
+func normalizeObjectSchemaProperties(schema any) any {
+	switch value := schema.(type) {
+	case map[string]any:
+		if schemaType, ok := value["type"].(string); ok && schemaType == "object" {
+			if _, ok := value["properties"]; !ok {
+				value["properties"] = map[string]any{}
+			}
+		}
+		for key, child := range value {
+			value[key] = normalizeObjectSchemaProperties(child)
+		}
+		return value
+	case []any:
+		for i, child := range value {
+			value[i] = normalizeObjectSchemaProperties(child)
+		}
+		return value
+	default:
+		return schema
+	}
 }
 
 func shouldMapClaudeThinkingToGPTReasoning(part gjson.Result) bool {
