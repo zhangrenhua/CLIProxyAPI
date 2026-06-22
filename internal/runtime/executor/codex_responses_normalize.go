@@ -23,10 +23,11 @@ import (
 //  1. Conversation items carrying role "tool" (a Chat Completions concept) are
 //     rewritten into Responses "function_call_output" items. The Responses input
 //     only accepts roles assistant/system/developer/user on message items.
-//  2. function_call / function_call_output items with an empty call_id are
-//     repaired by pairing them in order, and orphan outputs are dropped: an empty
-//     output with no preceding call, or a non-empty output whose call_id matches no
-//     function_call anywhere in the input (the upstream rejects both).
+//  2. Tool-call items with an empty call_id (function_call / custom_tool_call and
+//     their *_output) are repaired by pairing them in order within their family,
+//     and orphan outputs are dropped: an empty output with no preceding call, or a
+//     non-empty output whose call_id matches no tool call anywhere in the input
+//     (the upstream rejects both).
 //  3. Chat Completions style message content parts (type "text"/"image_url"/"file")
 //     are converted to the Responses part types (input_text/output_text per role,
 //     input_image, input_file).
@@ -121,9 +122,10 @@ func normalizeCodexResponsesToolChoice(ctx context.Context, provider string, bod
 }
 
 // normalizeCodexResponsesInputItems fixes role "tool" message items, chat-style
-// content parts, empty/orphan call_id values, and function_call items missing a
-// name (recovered from a nested "function" object, or dropped with their paired
-// output) in the Responses "input" array.
+// content parts, empty/orphan call_id values on tool-call items (function_call and
+// custom_tool_call families), and function_call items missing a name (recovered
+// from a nested "function" object, or dropped with their paired output) in the
+// Responses "input" array.
 func normalizeCodexResponsesInputItems(ctx context.Context, provider string, body []byte) []byte {
 	input := gjson.GetBytes(body, "input")
 	if !input.Exists() || !input.IsArray() {
@@ -133,11 +135,13 @@ func normalizeCodexResponsesInputItems(ctx context.Context, provider string, bod
 
 	items := input.Array()
 
-	// Pass 1: collect every non-empty call_id declared by a function_call item.
-	// These are the only valid targets a function_call_output may reference.
+	// Pass 1: collect every non-empty call_id declared by a tool-call item
+	// (function_call or custom_tool_call). These are the only valid targets a
+	// matching *_output item may reference.
 	validCallIDs := make(map[string]struct{}, 4)
 	for _, item := range items {
-		if strings.TrimSpace(item.Get("type").String()) == "function_call" {
+		switch strings.TrimSpace(item.Get("type").String()) {
+		case "function_call", "custom_tool_call":
 			if id := strings.TrimSpace(item.Get("call_id").String()); id != "" {
 				validCallIDs[id] = struct{}{}
 			}
@@ -146,7 +150,9 @@ func normalizeCodexResponsesInputItems(ctx context.Context, provider string, bod
 
 	// Pass 2: rewrite items.
 	rebuilt := make([][]byte, 0, len(items))
-	pendingCallIDs := make([]string, 0, 4)         // function_call ids awaiting their output, FIFO
+	// Tool-call ids awaiting their output, FIFO, kept per family ("function" vs
+	// "custom") so a *_output only pairs with a call of the same family.
+	pendingCallIDs := map[string][]string{}
 	droppedCallIDs := make(map[string]struct{}, 2) // function_call ids removed (e.g. missing name)
 	syntheticSeq := 0
 	changed := false
@@ -180,11 +186,15 @@ func normalizeCodexResponsesInputItems(ctx context.Context, provider string, bod
 		}
 
 		switch itemType {
-		case "function_call":
+		case "function_call", "custom_tool_call":
+			family := codexToolCallFamily(itemType)
 			callID := strings.TrimSpace(gjson.GetBytes(raw, "call_id").String())
-			// Responses requires a top-level "name". Recover it from a chat-style
-			// nested "function" object when missing; carry arguments along too.
-			if strings.TrimSpace(gjson.GetBytes(raw, "name").String()) == "" {
+			// function_call requires a top-level "name". Recover it from a chat-style
+			// nested "function" object when missing; carry arguments along too. A
+			// function_call with no recoverable name is invalid, so it is dropped (its
+			// paired output is dropped below). custom_tool_call carries no nested
+			// "function" form, so only its call_id is repaired here.
+			if itemType == "function_call" && strings.TrimSpace(gjson.GetBytes(raw, "name").String()) == "" {
 				if fn := gjson.GetBytes(raw, "function"); fn.IsObject() {
 					if fnName := strings.TrimSpace(fn.Get("name").String()); fnName != "" {
 						raw, _ = sjson.SetBytes(raw, "name", fnName)
@@ -196,53 +206,52 @@ func normalizeCodexResponsesInputItems(ctx context.Context, provider string, bod
 						helps.LogWithRequestID(ctx).Debugf("%s: flattened chat-style function_call name at input[%d]", provider, index)
 					}
 				}
-			}
-			// A function_call with no name is invalid; drop it (its paired output is
-			// dropped below) since it cannot be repaired.
-			if strings.TrimSpace(gjson.GetBytes(raw, "name").String()) == "" {
-				if callID != "" {
-					droppedCallIDs[callID] = struct{}{}
+				if strings.TrimSpace(gjson.GetBytes(raw, "name").String()) == "" {
+					if callID != "" {
+						droppedCallIDs[callID] = struct{}{}
+					}
+					changed = true
+					helps.LogWithRequestID(ctx).Debugf("%s: dropped function_call without a name at input[%d]", provider, index)
+					continue
 				}
-				changed = true
-				helps.LogWithRequestID(ctx).Debugf("%s: dropped function_call without a name at input[%d]", provider, index)
-				continue
 			}
 			if callID == "" {
 				syntheticSeq++
 				callID = fmt.Sprintf("call_normalized_%d", syntheticSeq)
 				raw, _ = sjson.SetBytes(raw, "call_id", callID)
 				changed = true
-				helps.LogWithRequestID(ctx).Debugf("%s: assigned synthetic call_id %q to function_call at input[%d]", provider, callID, index)
+				helps.LogWithRequestID(ctx).Debugf("%s: assigned synthetic call_id %q to %s at input[%d]", provider, callID, itemType, index)
 			}
-			pendingCallIDs = append(pendingCallIDs, callID)
-		case "function_call_output":
+			pendingCallIDs[family] = append(pendingCallIDs[family], callID)
+		case "function_call_output", "custom_tool_call_output":
+			family := codexToolCallFamily(itemType)
 			callID := strings.TrimSpace(gjson.GetBytes(raw, "call_id").String())
 			switch {
 			case callID == "":
-				if len(pendingCallIDs) == 0 {
+				if len(pendingCallIDs[family]) == 0 {
 					changed = true
-					helps.LogWithRequestID(ctx).Debugf("%s: dropped orphan function_call_output with empty call_id at input[%d]", provider, index)
+					helps.LogWithRequestID(ctx).Debugf("%s: dropped orphan %s with empty call_id at input[%d]", provider, itemType, index)
 					continue
 				}
-				callID = pendingCallIDs[0]
-				pendingCallIDs = pendingCallIDs[1:]
+				callID = pendingCallIDs[family][0]
+				pendingCallIDs[family] = pendingCallIDs[family][1:]
 				raw, _ = sjson.SetBytes(raw, "call_id", callID)
 				changed = true
-				helps.LogWithRequestID(ctx).Debugf("%s: paired function_call_output at input[%d] with call_id %q", provider, index, callID)
+				helps.LogWithRequestID(ctx).Debugf("%s: paired %s at input[%d] with call_id %q", provider, itemType, index, callID)
 			default:
 				if _, dropped := droppedCallIDs[callID]; dropped {
-					// Its function_call was removed (e.g. missing name); drop the output too.
+					// Its tool call was removed (e.g. function_call missing name); drop the output too.
 					changed = true
-					helps.LogWithRequestID(ctx).Debugf("%s: dropped function_call_output at input[%d] (its function_call %q was removed)", provider, index, callID)
+					helps.LogWithRequestID(ctx).Debugf("%s: dropped %s at input[%d] (its tool call %q was removed)", provider, itemType, index, callID)
 					continue
 				}
 				if _, ok := validCallIDs[callID]; !ok {
-					// Non-empty call_id that matches no function_call in the input.
+					// Non-empty call_id that matches no tool call in the input.
 					changed = true
-					helps.LogWithRequestID(ctx).Debugf("%s: dropped orphan function_call_output at input[%d] (call_id %q has no matching function_call)", provider, index, callID)
+					helps.LogWithRequestID(ctx).Debugf("%s: dropped orphan %s at input[%d] (call_id %q has no matching tool call)", provider, itemType, index, callID)
 					continue
 				}
-				pendingCallIDs = removeFirstString(pendingCallIDs, callID)
+				pendingCallIDs[family] = removeFirstString(pendingCallIDs[family], callID)
 			}
 		}
 
@@ -412,6 +421,16 @@ func setCodexToolOutputContent(funcOutput []byte, content gjson.Result) []byte {
 		funcOutput, _ = sjson.SetBytes(funcOutput, "output", fallback)
 	}
 	return funcOutput
+}
+
+// codexToolCallFamily groups the paired tool-call item types so a *_output only
+// pairs with a *_call of the same family. "custom_tool_call"/"custom_tool_call_output"
+// belong to the "custom" family; "function_call"/"function_call_output" to "function".
+func codexToolCallFamily(itemType string) string {
+	if strings.HasPrefix(itemType, "custom_tool_call") {
+		return "custom"
+	}
+	return "function"
 }
 
 // removeFirstString removes the first occurrence of target from s and returns the result.

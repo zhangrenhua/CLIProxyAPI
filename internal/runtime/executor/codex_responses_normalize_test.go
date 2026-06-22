@@ -337,3 +337,58 @@ func TestNormalizeCodexResponsesIgnoresNonArrayInput(t *testing.T) {
 		t.Fatalf("expected non-array input unchanged, got %s", out)
 	}
 }
+
+func TestNormalizeCodexResponsesSyntheticCallIDForCustomToolCall(t *testing.T) {
+	// custom_tool_call and its output both have an empty call_id; the upstream
+	// rejects empty call_id, so a synthetic id must be assigned and the output paired.
+	body := []byte(`{"input":[
+		{"type":"custom_tool_call","call_id":"","name":"c","input":"x"},
+		{"type":"custom_tool_call_output","call_id":"","output":"done"}
+	]}`)
+
+	out := normalizeCodexResponsesRequest(context.Background(), "test", body)
+
+	callID := gjson.GetBytes(out, "input.0.call_id").String()
+	if callID == "" {
+		t.Fatalf("expected synthetic call_id on custom_tool_call, got empty: %s", out)
+	}
+	if got := gjson.GetBytes(out, "input.1.call_id").String(); got != callID {
+		t.Fatalf("expected custom_tool_call_output paired with %q, got %q", callID, got)
+	}
+}
+
+func TestNormalizeCodexResponsesDropsOrphanCustomToolCallOutput(t *testing.T) {
+	body := []byte(`{"input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+		{"type":"custom_tool_call_output","call_id":"","output":"orphan"}
+	]}`)
+
+	out := normalizeCodexResponsesRequest(context.Background(), "test", body)
+
+	if n := len(gjson.GetBytes(out, "input").Array()); n != 1 {
+		t.Fatalf("expected orphan custom output dropped (len 1), got len %d: %s", n, out)
+	}
+}
+
+func TestNormalizeCodexResponsesDoesNotCrossPairToolCallFamilies(t *testing.T) {
+	// A function_call is pending, but a custom_tool_call_output with empty call_id
+	// must NOT borrow the function_call's id. With no pending custom call it is an
+	// orphan and is dropped; the function_call survives untouched.
+	body := []byte(`{"input":[
+		{"type":"function_call","call_id":"call_fn","name":"f","arguments":"{}"},
+		{"type":"custom_tool_call_output","call_id":"","output":"x"}
+	]}`)
+
+	out := normalizeCodexResponsesRequest(context.Background(), "test", body)
+
+	input := gjson.GetBytes(out, "input").Array()
+	if len(input) != 1 {
+		t.Fatalf("expected cross-family orphan dropped (len 1), got len %d: %s", len(input), out)
+	}
+	if got := input[0].Get("type").String(); got != "function_call" {
+		t.Fatalf("expected surviving function_call, got %q", got)
+	}
+	if got := input[0].Get("call_id").String(); got != "call_fn" {
+		t.Fatalf("expected function_call call_id unchanged, got %q", got)
+	}
+}
