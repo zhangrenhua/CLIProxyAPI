@@ -21,6 +21,7 @@ type openAICompatPoolExecutor struct {
 	executeModels     []string
 	countModels       []string
 	streamModels      []string
+	executePayloads   map[string][]byte
 	executeErrors     map[string]error
 	countErrors       map[string]error
 	streamFirstErrors map[string]error
@@ -35,10 +36,14 @@ func (e *openAICompatPoolExecutor) Execute(ctx context.Context, auth *Auth, req 
 	_ = opts
 	e.mu.Lock()
 	e.executeModels = append(e.executeModels, req.Model)
+	payload := append([]byte(nil), e.executePayloads[req.Model]...)
 	err := e.executeErrors[req.Model]
 	e.mu.Unlock()
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
+	}
+	if len(payload) > 0 {
+		return cliproxyexecutor.Response{Payload: payload}, nil
 	}
 	return cliproxyexecutor.Response{Payload: []byte(req.Model)}, nil
 }
@@ -251,6 +256,21 @@ func TestResolveModelAliasPoolFromConfigModels(t *testing.T) {
 	}
 }
 
+func TestResolveModelAliasPoolPrefersExactSuffixedAlias(t *testing.T) {
+	models := []modelAliasEntry{
+		internalconfig.OpenAICompatibilityModel{Name: "base-model", Alias: "public"},
+		internalconfig.OpenAICompatibilityModel{Name: "low-model", Alias: "public(low)", ForceMapping: true},
+	}
+	got := resolveModelAliasPoolFromConfigModels("public(low)", models)
+	if len(got) != 1 || got[0] != "low-model(low)" {
+		t.Fatalf("exact suffixed pool = %v, want [low-model(low)]", got)
+	}
+	result := resolveModelAliasResultFromConfigModels("public(low)", models)
+	if result.UpstreamModel != "low-model(low)" || !result.ForceMapping {
+		t.Fatalf("exact suffixed alias result = %+v, want low-model(low) with force mapping", result)
+	}
+}
+
 func TestManagerExecute_OpenAICompatAliasPoolRotatesWithinAuth(t *testing.T) {
 	alias := "claude-opus-4.66"
 	executor := &openAICompatPoolExecutor{id: openAICompatPoolProviderKey}
@@ -277,6 +297,44 @@ func TestManagerExecute_OpenAICompatAliasPoolRotatesWithinAuth(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("execute call %d model = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestManagerExecute_OpenAICompatAliasPoolForceMappingRotatesAndRewritesResponse(t *testing.T) {
+	alias := "claude-opus-4.66"
+	executor := &openAICompatPoolExecutor{
+		id: openAICompatPoolProviderKey,
+		executePayloads: map[string][]byte{
+			"deepseek-v3.1": []byte(`{"model":"deepseek-v3.1"}`),
+			"glm-5":         []byte(`{"model":"glm-5"}`),
+		},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "deepseek-v3.1", Alias: alias, ForceMapping: true},
+		{Name: "glm-5", Alias: alias, ForceMapping: true},
+	}, executor)
+
+	var payloads []string
+	for i := 0; i < 2; i++ {
+		resp, err := m.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+		if err != nil {
+			t.Fatalf("execute %d: %v", i, err)
+		}
+		payloads = append(payloads, string(resp.Payload))
+	}
+
+	got := executor.ExecuteModels()
+	wantModels := []string{"deepseek-v3.1", "glm-5"}
+	for i := range wantModels {
+		if got[i] != wantModels[i] {
+			t.Fatalf("execute call %d model = %q, want %q", i, got[i], wantModels[i])
+		}
+	}
+	wantPayloads := []string{`{"model":"claude-opus-4.66"}`, `{"model":"claude-opus-4.66"}`}
+	for i := range wantPayloads {
+		if payloads[i] != wantPayloads[i] {
+			t.Fatalf("payload %d = %s, want %s", i, payloads[i], wantPayloads[i])
 		}
 	}
 }
@@ -407,6 +465,27 @@ func TestManagerExecute_OpenAICompatAliasPoolFallsBackWithinSameAuth(t *testing.
 		if got[i] != want[i] {
 			t.Fatalf("execute call %d model = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestManagerExecute_OpenAICompatAliasPoolUsesSelectedModelForceMapping(t *testing.T) {
+	alias := "public-model"
+	executor := &openAICompatPoolExecutor{
+		id:              openAICompatPoolProviderKey,
+		executeErrors:   map[string]error{"first-upstream": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}},
+		executePayloads: map[string][]byte{"second-upstream": []byte(`{"model":"second-upstream"}`)},
+	}
+	manager := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "first-upstream", Alias: alias, ForceMapping: true},
+		{Name: "second-upstream", Alias: alias},
+	}, executor)
+
+	response, errExecute := manager.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := string(response.Payload); got != `{"model":"second-upstream"}` {
+		t.Fatalf("payload = %s, want selected model without force mapping", got)
 	}
 }
 

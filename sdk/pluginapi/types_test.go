@@ -24,6 +24,7 @@ var _ RequestNormalizer = (*compileTimePlugin)(nil)
 var _ ResponseTranslator = (*compileTimePlugin)(nil)
 var _ ResponseNormalizer = (*compileTimePlugin)(nil)
 var _ RequestInterceptor = (*compileTimePlugin)(nil)
+var _ RequestLifecyclePlugin = (*compileTimePlugin)(nil)
 var _ ResponseInterceptor = (*compileTimePlugin)(nil)
 var _ StreamChunkInterceptor = (*compileTimePlugin)(nil)
 var _ ThinkingApplier = (*compileTimePlugin)(nil)
@@ -48,6 +49,61 @@ func TestMetadataConfigFieldsExposePluginSchema(t *testing.T) {
 	}
 	if meta.Logo == "" || len(meta.ConfigFields) != 1 {
 		t.Fatalf("metadata missing logo or config fields: %#v", meta)
+	}
+}
+
+func TestAuthParseResponseSupportsMultipleAuths(t *testing.T) {
+	resp := AuthParseResponse{
+		Handled: true,
+		Auth: AuthData{
+			Provider: "gemini-cli",
+			ID:       "primary.json",
+		},
+		Auths: []AuthData{
+			{Provider: "gemini-cli", ID: "primary.json"},
+			{Provider: "gemini-cli", ID: "primary-project-a.json"},
+		},
+	}
+
+	raw, errMarshal := json.Marshal(resp)
+	if errMarshal != nil {
+		t.Fatalf("Marshal() error = %v", errMarshal)
+	}
+	var decoded AuthParseResponse
+	if errUnmarshal := json.Unmarshal(raw, &decoded); errUnmarshal != nil {
+		t.Fatalf("Unmarshal() error = %v", errUnmarshal)
+	}
+	if !decoded.Handled || len(decoded.Auths) != 2 || decoded.Auths[1].ID != "primary-project-a.json" {
+		t.Fatalf("decoded response = %#v, want two auths", decoded)
+	}
+	if decoded.Auth.ID != "primary.json" {
+		t.Fatalf("decoded Auth.ID = %q, want primary.json", decoded.Auth.ID)
+	}
+}
+
+func TestAuthLoginPollResponseSupportsMultipleAuths(t *testing.T) {
+	resp := AuthLoginPollResponse{
+		Status: AuthLoginStatusSuccess,
+		Auth: AuthData{
+			Provider: "gemini-cli",
+			ID:       "primary.json",
+		},
+		Auths: []AuthData{
+			{Provider: "gemini-cli", ID: "primary.json"},
+			{Provider: "gemini-cli", ID: "primary-project-a.json"},
+		},
+	}
+
+	raw, errMarshal := json.Marshal(resp)
+	if errMarshal != nil {
+		t.Fatalf("Marshal() error = %v", errMarshal)
+	}
+	var decoded AuthLoginPollResponse
+	if errUnmarshal := json.Unmarshal(raw, &decoded); errUnmarshal != nil {
+		t.Fatalf("Unmarshal() error = %v", errUnmarshal)
+	}
+	if decoded.Status != AuthLoginStatusSuccess || len(decoded.Auths) != 2 {
+		t.Fatalf("decoded response = %#v, want success with two auths", decoded)
 	}
 }
 
@@ -462,6 +518,8 @@ func (compileTimePlugin) InterceptRequestBeforeAuth(context.Context, RequestInte
 func (compileTimePlugin) InterceptRequestAfterAuth(context.Context, RequestInterceptRequest) (RequestInterceptResponse, error) {
 	return RequestInterceptResponse{}, nil
 }
+
+func (compileTimePlugin) HandleRequestComplete(context.Context, RequestCompletion) error { return nil }
 
 func (compileTimePlugin) InterceptResponse(context.Context, ResponseInterceptRequest) (ResponseInterceptResponse, error) {
 	return ResponseInterceptResponse{}, nil

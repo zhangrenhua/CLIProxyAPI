@@ -18,10 +18,12 @@ import (
 
 	"github.com/joho/godotenv"
 	configaccess "github.com/router-for-me/CLIProxyAPI/v7/internal/access/config_access"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cmd"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
@@ -35,6 +37,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -53,7 +56,7 @@ func init() {
 	buildinfo.BuildDate = BuildDate
 }
 
-func shouldStartExampleAPIKeyWarningServer(cfg *config.Config, commandMode, tuiMode, standalone, cloudConfigMissing, homeMode bool) bool {
+func shouldEnableExampleAPIKeySafeMode(cfg *config.Config, commandMode, tuiMode, standalone, cloudConfigMissing, homeMode bool) bool {
 	if cfg == nil || commandMode || homeMode || cloudConfigMissing {
 		return false
 	}
@@ -105,7 +108,7 @@ func main() {
 	flag.BoolVar(&homeDisableClusterDiscovery, "home-disable-cluster-discovery", false, "Disable Home CLUSTER NODES discovery and keep using the configured -home-jwt address")
 	flag.BoolVar(&tuiMode, "tui", false, "Start with terminal management UI")
 	flag.BoolVar(&standalone, "standalone", false, "In TUI mode, start an embedded local server")
-	flag.BoolVar(&localModel, "local-model", false, "Use embedded model catalog only, skip remote model fetching")
+	flag.BoolVar(&localModel, "local-model", false, "Use embedded models.json and codex_client_models.json only, skip remote model catalog fetching")
 
 	flag.CommandLine.Usage = func() {
 		out := flag.CommandLine.Output()
@@ -148,6 +151,9 @@ func main() {
 	var cfg *config.Config
 	var isCloudDeploy bool
 	var configLoadedFromHome bool
+	var homeClient *home.Client
+	var homePluginSyncReport homeplugins.SyncReport
+	var homePluginStatusReady bool
 	var (
 		usePostgresStore     bool
 		pgStoreDSN           string
@@ -277,7 +283,7 @@ func main() {
 		if homeDisableClusterDiscovery {
 			homeCfg.DisableClusterDiscovery = true
 		}
-		homeClient := home.New(homeCfg)
+		homeClient = home.New(homeCfg)
 		defer homeClient.Close()
 
 		ctxHomeConfig, cancelHomeConfig := context.WithTimeout(context.Background(), 30*time.Second)
@@ -299,6 +305,57 @@ func main() {
 		parsed.Home = homeCfg
 		parsed.Port = 8317 // Default to 8317 for home mode, can be overridden by home config
 		parsed.UsageStatisticsEnabled = true
+		pluginSyncCfg := *parsed
+		parsed.Plugins.StoreAuth = nil
+		var errHomePlugins error
+		platform := homeplugins.CurrentPlatform()
+		if pluginSyncCfg.Plugins.Enabled {
+			ctxHomePlugins, cancelHomePlugins := context.WithTimeout(context.Background(), 30*time.Second)
+			installedVersions, errInstalledPlugins := homeplugins.InstalledVersions(&pluginSyncCfg)
+			if errInstalledPlugins != nil {
+				homePluginStatusReady = true
+				errHomePlugins = errInstalledPlugins
+				homePluginSyncReport = homeplugins.CompletedSyncReport(platform, errInstalledPlugins)
+			} else {
+				pluginSyncRequest := sdkpluginstore.PluginSyncRequest{
+					SchemaVersion:     sdkpluginstore.PluginSyncSchemaVersion,
+					GOOS:              platform.GOOS,
+					GOARCH:            platform.GOARCH,
+					InstalledVersions: installedVersions,
+				}
+				pluginSyncResponse, errFetchPlugins := homeClient.GetPluginSync(ctxHomePlugins, pluginSyncRequest)
+				errHomePlugins = errFetchPlugins
+				switch {
+				case errHomePlugins == nil:
+					homePluginStatusReady = true
+					homePluginSyncReport, errHomePlugins = homeplugins.SyncResolvedWithReport(ctxHomePlugins, &pluginSyncCfg, pluginSyncResponse.Items, pluginSyncResponse.ExpiresAt, pluginSyncRequest.InstalledVersions, pluginHost)
+				case errors.Is(errHomePlugins, home.ErrPluginSyncUnsupported):
+					homePluginStatusReady = true
+					homePluginSyncReport, errHomePlugins = homeplugins.SyncWithReport(ctxHomePlugins, &pluginSyncCfg, pluginHost)
+				default:
+					homePluginStatusReady = true
+					homePluginSyncReport = homeplugins.CompletedSyncReport(platform, errHomePlugins)
+				}
+				pluginSyncRequest.Clear()
+				pluginSyncResponse.Clear()
+			}
+			cancelHomePlugins()
+		} else {
+			homePluginStatusReady = true
+			homePluginSyncReport = homeplugins.CompletedSyncReport(platform, nil)
+		}
+		if errHomePlugins != nil {
+			log.Errorf("failed to sync plugins from home: %v", errHomePlugins)
+		}
+		if homePluginStatusReady {
+			errReportPlugins := home.ReportPluginStatus(context.Background(), homeClient, homeCfg.NodeID, homePluginSyncReport)
+			if errReportPlugins != nil {
+				log.Warnf("failed to report home plugin sync status: %v", errReportPlugins)
+			}
+		}
+		if errHomePlugins != nil {
+			return
+		}
 		cfg = parsed
 
 		// Keep a non-empty config path for downstream components (log paths, management assets, etc),
@@ -530,11 +587,12 @@ func main() {
 	commandMode := vertexImport != "" || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || xaiLogin
 	cloudConfigMissing := isCloudDeploy && !configFileExists
 	homeMode := configLoadedFromHome || (cfg != nil && cfg.Home.Enabled)
-	if shouldStartExampleAPIKeyWarningServer(cfg, commandMode, tuiMode, standalone, cloudConfigMissing, homeMode) {
+	exampleAPIKeySafeMode := shouldEnableExampleAPIKeySafeMode(cfg, commandMode, tuiMode, standalone, cloudConfigMissing, homeMode)
+	serverOptions := []api.ServerOption(nil)
+	if exampleAPIKeySafeMode {
 		matches := safemode.ExampleAPIKeys(cfg.APIKeys)
-		log.WithField("api_keys", strings.Join(matches, ",")).Error("unsafe example API key configured; starting warning-only server")
-		cmd.StartExampleAPIKeyWarningServer(cfg, configFilePath, matches)
-		return
+		log.WithField("api_keys", strings.Join(matches, ",")).Error("unsafe example API key configured; proxy API endpoints disabled until api-keys is updated")
+		serverOptions = append(serverOptions, api.WithExampleAPIKeySafeMode())
 	}
 
 	// Register the shared token store once so all components use the same persistence backend.
@@ -551,6 +609,19 @@ func main() {
 	// Register built-in access providers before constructing services.
 	configaccess.Register(&cfg.SDKConfig)
 	pluginHost.ApplyConfig(context.Background(), cfg)
+	if configLoadedFromHome && homePluginStatusReady {
+		errHomePluginLoad := homeplugins.MarkLoadResults(&homePluginSyncReport, pluginHost)
+		errReportPlugins := home.ReportPluginStatus(context.Background(), homeClient, cfg.Home.NodeID, homePluginSyncReport)
+		if errHomePluginLoad != nil {
+			log.Errorf("failed to load home plugins: %v", errHomePluginLoad)
+		}
+		if errReportPlugins != nil {
+			log.Warnf("failed to report home plugin load status: %v", errReportPlugins)
+		}
+		if errHomePluginLoad != nil {
+			return
+		}
+	}
 	if pluginHost.HasTriggeredCommandLineFlags() {
 		if exitCode, handled := pluginHost.ExecuteCommandLine(context.Background(), os.Args[0], os.Args[1:], configFilePath, flag.CommandLine); handled {
 			if exitCode != 0 {
@@ -589,18 +660,14 @@ func main() {
 			return
 		}
 		if localModel && (!tuiMode || standalone) {
-			log.Info("Local model mode: using embedded model catalog, remote model updates disabled")
+			log.Info("Local model mode: using embedded model catalogs, remote model updates disabled")
 		}
 		if tuiMode {
 			if standalone {
 				// Standalone mode: start an embedded local server and connect TUI client to it.
 				managementasset.StartAutoUpdater(context.Background(), configFilePath)
 				misc.StartAntigravityVersionUpdater(context.Background())
-				if !localModel && !cfg.Home.Enabled {
-					registry.StartModelsUpdater(context.Background())
-				} else if cfg.Home.Enabled {
-					log.Info("Home mode: remote model updates disabled")
-				}
+				startModelCatalogUpdaters(localModel, cfg.Home.Enabled)
 				hook := tui.NewLogHook(2000)
 				hook.SetFormatter(&logging.LogFormatter{})
 				log.AddHook(hook)
@@ -630,7 +697,7 @@ func main() {
 					password = localMgmtPassword
 				}
 
-				cancel, done := cmd.StartServiceBackgroundWithPluginHost(cfg, configFilePath, password, pluginHost)
+				cancel, done := cmd.StartServiceBackgroundWithPluginHost(cfg, configFilePath, password, pluginHost, serverOptions...)
 
 				client := tui.NewClient(cfg.Port, password)
 				ready := false
@@ -674,13 +741,31 @@ func main() {
 			// Start the main proxy service
 			managementasset.StartAutoUpdater(context.Background(), configFilePath)
 			misc.StartAntigravityVersionUpdater(context.Background())
-			if !localModel && !cfg.Home.Enabled {
-				registry.StartModelsUpdater(context.Background())
-			} else if cfg.Home.Enabled {
-				log.Info("Home mode: remote model updates disabled")
-			}
-			cmd.StartServiceWithPluginHost(cfg, configFilePath, password, pluginHost)
+			startModelCatalogUpdaters(localModel, cfg.Home.Enabled)
+			cmd.StartServiceWithPluginHost(cfg, configFilePath, password, pluginHost, serverOptions...)
 		}
+	}
+}
+
+// modelCatalogUpdaterPlan decides which remote model catalogs should refresh.
+// Codex client templates still refresh under Home mode because the model list
+// comes from Home IDs while template metadata stays edge-local.
+func modelCatalogUpdaterPlan(localModel, homeEnabled bool) (startModels, startCodexClient bool) {
+	if localModel {
+		return false, false
+	}
+	return !homeEnabled, true
+}
+
+func startModelCatalogUpdaters(localModel, homeEnabled bool) {
+	startModels, startCodexClient := modelCatalogUpdaterPlan(localModel, homeEnabled)
+	if startCodexClient {
+		registry.StartCodexClientModelsUpdater(context.Background())
+	}
+	if startModels {
+		registry.StartModelsUpdater(context.Background())
+	} else if homeEnabled {
+		log.Info("Home mode: remote models.json updates disabled; Codex client model list follows Home model IDs")
 	}
 }
 

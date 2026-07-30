@@ -2,6 +2,7 @@ package responses
 
 import (
 	"encoding/base64"
+	"strings"
 	"testing"
 
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
@@ -156,6 +157,53 @@ func TestConvertOpenAIResponsesRequestToClaude_DropsIncompatibleReasoningSignatu
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToClaude_FunctionCallOutputPreservesInputImage(t *testing.T) {
+	const imageB64 = "iVBORw0KGgo="
+	dataURL := "data:image/png;base64," + imageB64
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{
+				"type":"function_call",
+				"call_id":"call_view_image_1",
+				"name":"view_image",
+				"arguments":"{}"
+			},
+			{
+				"type":"function_call_output",
+				"call_id":"call_view_image_1",
+				"output":[
+					{
+						"type":"input_image",
+						"image_url":"` + dataURL + `",
+						"detail":"high"
+					}
+				]
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	toolResult := root.Get("messages.1.content.0")
+	if got := toolResult.Get("type").String(); got != "tool_result" {
+		t.Fatalf("tool_result type = %q, want tool_result. Output: %s", got, string(out))
+	}
+	if got := toolResult.Get("content.0.type").String(); got != "image" {
+		t.Fatalf("tool_result content block type = %q, want image. Output: %s", got, string(out))
+	}
+	if got := toolResult.Get("content.0.source.media_type").String(); got != "image/png" {
+		t.Fatalf("image media_type = %q, want image/png. Output: %s", got, string(out))
+	}
+	if got := toolResult.Get("content.0.source.data").String(); got != imageB64 {
+		t.Fatalf("image data = %q, want raw base64 without data URL prefix", got)
+	}
+	if strings.Contains(toolResult.Get("content").Raw, "data:image") {
+		t.Fatalf("tool_result content must not embed data URL as text. Output: %s", string(out))
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToClaude_KeepsToolUseAdjacentToToolResult(t *testing.T) {
 	raw := []byte(`{
 		"model":"claude-test",
@@ -236,6 +284,38 @@ func TestConvertOpenAIResponsesRequestToClaude_DropsApplyPatchCustomTool(t *test
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToClaude_NormalizesRootToolSchemaUnion(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"tools":[{
+			"type":"function",
+			"name":"lookup",
+			"parameters":{
+				"type":"object",
+				"properties":{"query":{"type":"string"},"id":{"type":"string"}},
+				"oneOf":[{"required":["query"]},{"required":["id"]}]
+			}
+		}]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	schema := gjson.GetBytes(out, "tools.0.input_schema")
+
+	if got := schema.Get("type").String(); got != "object" {
+		t.Fatalf("input_schema.type = %q, want object. Output: %s", got, string(out))
+	}
+	if schema.Get("oneOf").Exists() {
+		t.Fatalf("input_schema should not contain root oneOf. Output: %s", string(out))
+	}
+	if !schema.Get("properties.query").Exists() || !schema.Get("properties.id").Exists() {
+		t.Fatalf("input_schema should preserve query and id properties. Output: %s", string(out))
+	}
+	if schema.Get("required").Exists() {
+		t.Fatalf("input_schema should not merge alternative required fields. Output: %s", string(out))
+	}
+}
+
 func testClaudeResponsesThinkingSignature(t *testing.T) (string, string) {
 	t.Helper()
 	channelBlock := []byte{}
@@ -272,4 +352,34 @@ func testGPTResponsesReasoningSignature() string {
 		payload[i] = byte(i)
 	}
 	return base64.URLEncoding.EncodeToString(payload)
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_PreservesContentPartCacheControl(t *testing.T) {
+	inputJSON := `{
+		"model": "gpt-4.1",
+		"input": [
+			{
+				"type": "message",
+				"role": "user",
+				"content": [
+					{"type": "input_text", "text": "cached prefix", "cache_control": {"type": "ephemeral"}},
+					{"type": "input_text", "text": "fresh question"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-4-5", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+
+	content := resultJSON.Get("messages.0.content")
+	if !content.IsArray() {
+		t.Fatalf("expected content array when cache_control is present, got %s", result)
+	}
+	if got := content.Get("0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("content.0.cache_control.type = %q, want ephemeral. Output: %s", got, result)
+	}
+	if content.Get("1.cache_control").Exists() {
+		t.Fatalf("content.1 should not have cache_control. Output: %s", result)
+	}
 }

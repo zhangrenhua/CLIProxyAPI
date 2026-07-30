@@ -35,6 +35,19 @@ type rpcThinkingApplier struct {
 	*rpcPluginAdapter
 }
 
+type rpcPluginError struct {
+	message    string
+	statusCode int
+}
+
+func (e rpcPluginError) Error() string {
+	return e.message
+}
+
+func (e rpcPluginError) StatusCode() int {
+	return e.statusCode
+}
+
 type rpcResponseNormalizer struct {
 	*rpcPluginAdapter
 	method string
@@ -94,6 +107,9 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
 	if resp.Capabilities.RequestInterceptor {
 		plugin.Capabilities.RequestInterceptor = adapter
 	}
+	if resp.Capabilities.RequestLifecyclePlugin {
+		plugin.Capabilities.RequestLifecyclePlugin = adapter
+	}
 	if resp.Capabilities.ResponseTranslator {
 		plugin.Capabilities.ResponseTranslator = adapter
 	}
@@ -140,6 +156,9 @@ func callPlugin[T any](ctx context.Context, client pluginClient, method string, 
 	}
 	out, errDecode := decodeEnvelopeResult[T](envelope)
 	if errDecode != nil {
+		if !envelope.OK {
+			return zero, errDecode
+		}
 		return zero, fmt.Errorf("decode plugin result %s: %w", method, errDecode)
 	}
 	return out, nil
@@ -175,6 +194,9 @@ func sanitizePluginRequest(request any) any {
 	case pluginapi.RequestInterceptRequest:
 		req.Metadata = sanitizePluginMetadata(req.Metadata)
 		return req
+	case pluginapi.RequestCompletion:
+		req.Metadata = sanitizePluginMetadata(req.Metadata)
+		return req
 	case pluginapi.ResponseInterceptRequest:
 		req.Metadata = sanitizePluginMetadata(req.Metadata)
 		return req
@@ -185,6 +207,9 @@ func sanitizePluginRequest(request any) any {
 		req.Metadata = sanitizePluginMetadata(req.Metadata)
 		return req
 	case rpcModelRouteRequest:
+		req.Metadata = sanitizePluginMetadata(req.Metadata)
+		return req
+	case rpcRequestCompletion:
 		req.Metadata = sanitizePluginMetadata(req.Metadata)
 		return req
 	case rpcResponseInterceptRequest:
@@ -260,11 +285,26 @@ func decodeRPCEnvelope[T any](raw []byte) (T, error) {
 	return decodeEnvelopeResult[T](envelope)
 }
 
+func isPluginErrorEnvelope(raw []byte) bool {
+	var envelope pluginabi.Envelope
+	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
+		return false
+	}
+	return !envelope.OK && envelope.Error != nil
+}
+
 func decodeEnvelopeResult[T any](envelope pluginabi.Envelope) (T, error) {
 	var zero T
 	if !envelope.OK {
 		if envelope.Error != nil {
-			return zero, fmt.Errorf("%s", envelope.Error.Message)
+			message := strings.TrimSpace(envelope.Error.Message)
+			if message == "" {
+				message = "plugin call failed"
+			}
+			if envelope.Error.HTTPStatus > 0 {
+				return zero, rpcPluginError{message: message, statusCode: envelope.Error.HTTPStatus}
+			}
+			return zero, fmt.Errorf("%s", message)
 		}
 		return zero, fmt.Errorf("plugin call failed")
 	}
@@ -443,6 +483,16 @@ func (a *rpcPluginAdapter) InterceptRequestAfterAuth(ctx context.Context, req pl
 		RequestInterceptRequest: req,
 		HostCallbackID:          callbackID,
 	})
+}
+
+func (a *rpcPluginAdapter) HandleRequestComplete(ctx context.Context, completion pluginapi.RequestCompletion) error {
+	callbackID, closeCallback := a.openHostCallbackContext(ctx)
+	defer closeCallback()
+	_, errCall := callPlugin[rpcEmptyResponse](ctx, a.client, pluginabi.MethodRequestComplete, rpcRequestCompletion{
+		RequestCompletion: completion,
+		HostCallbackID:    callbackID,
+	})
+	return errCall
 }
 
 func (a *rpcPluginAdapter) TranslateResponse(ctx context.Context, req pluginapi.ResponseTransformRequest) (pluginapi.PayloadResponse, error) {
